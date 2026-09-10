@@ -33,6 +33,7 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import type * as Sink from "effect/Sink";
@@ -54,6 +55,11 @@ import { commandCodeTurnArgs } from "../commandCodeLaunchArgs.ts";
 const ANSI_ESCAPE_REGEX = /\u001b\[[0-9;]*m/g;
 
 const isoNow = (): Effect.Effect<string> => Effect.map(DateTime.now, DateTime.formatIso);
+
+/** Bound the stdin prompt write like the CLI probe deadline so a broken pipe can't hang a turn. */
+const STDIN_WRITE_TIMEOUT = "15 seconds" as const;
+/** Skip a single NDJSON line over ~1MB so one bad line can't OOM the server. */
+const MAX_NDJSON_LINE_CHARS = 1_048_576;
 
 // ── NDJSON frame parsing ────────────────────────────────────────────
 
@@ -482,10 +488,33 @@ export function makeCommandCodeAdapter(
           return "interrupted" as const;
         }
 
-        // Stream the prompt over stdin; Command Code auto-detects piped input.
-        yield* Stream.run(Stream.encodeText(Stream.make(input.prompt)), child.stdin).pipe(
-          Effect.ignore,
+        // Bound the prompt write: an unwritten stdin leaves the CLI waiting
+        // for a prompt while we wait on exitCode forever. Time out like the
+        // CLI probe deadline and fail the turn instead of hanging.
+        const stdinWritten = yield* Stream.run(
+          Stream.encodeText(Stream.make(input.prompt)),
+          child.stdin,
+        ).pipe(
+          Effect.timeoutOption(STDIN_WRITE_TIMEOUT),
+          Effect.orElseSucceed(() => Option.none()),
         );
+        if (Option.isNone(stdinWritten)) {
+          yield* child.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.ignore);
+          const stdinMessage = `Command Code turn failed: timed out writing prompt to stdin (${STDIN_WRITE_TIMEOUT}).`;
+          yield* offer({
+            type: "runtime.error",
+            threadId: input.threadId,
+            turnId: input.turnId,
+            payload: { message: stdinMessage, class: "provider_error" },
+          });
+          yield* offer({
+            type: "turn.completed",
+            threadId: input.threadId,
+            turnId: input.turnId,
+            payload: { state: "failed", errorMessage: stdinMessage },
+          });
+          return "failed" as const;
+        }
 
         let buffer = "";
         let stderrTail = "";
@@ -725,7 +754,13 @@ export function makeCommandCodeAdapter(
               while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
                 const line = buffer.slice(0, newlineIndex);
                 buffer = buffer.slice(newlineIndex + 1);
+                if (line.length > MAX_NDJSON_LINE_CHARS) {
+                  continue;
+                }
                 yield* handleLine(line);
+              }
+              if (buffer.length > MAX_NDJSON_LINE_CHARS) {
+                buffer = "";
               }
             }),
           ),
@@ -741,18 +776,19 @@ export function makeCommandCodeAdapter(
           ),
         );
 
-        // Run the parse loops alongside the exit wait; all three finish when
-        // the subprocess closes its pipes.
+        // Run the parse loops alongside the exit wait. When the child is
+        // killed for an interrupt, `child.exitCode` fails instead of
+        // resolving — treat that as an expected kill, not a turn failure.
         const [, , exitRaw] = yield* Effect.all([stdoutLoop, stderrLoop, child.exitCode], {
           concurrency: "unbounded",
-        });
+        }).pipe(Effect.orElseSucceed(() => [undefined, undefined, -1] as const));
         const exitCode = typeof exitRaw === "number" ? exitRaw : Number(exitRaw);
 
-        // Drain anything left after the last newline.
-        if (buffer.trim().length > 0) {
+        // Drain anything left after the last newline, still respecting the cap.
+        if (buffer.trim().length > 0 && buffer.length <= MAX_NDJSON_LINE_CHARS) {
           yield* handleLine(buffer);
-          buffer = "";
         }
+        buffer = "";
 
         const wasInterrupted = runCancel.requested;
         const usage = lastUsage;

@@ -31,14 +31,22 @@ function stripAnsi(value: string): string {
 }
 
 /**
- * True for the plain category headers (`Open Source`, `Anthropic`, …) that
- * would otherwise be misread as a one-token slug row.
+ * True for the plain category headers (`Open Source`, `Anthropic`, `xAI`, …)
+ * that would otherwise be misread as a one-token slug row.
  */
 function isCategoryHeader(slug: string, note: string | undefined): boolean {
   if (note !== undefined) return false;
   // Real slugs are lowercase or qualified (provider/model). Headers are
-  // capitalized single words with no qualifier.
-  return /^[A-Z]/.test(slug) && !slug.includes("/") && !slug.includes(":");
+  // unqualified single tokens containing an uppercase letter (`Anthropic`,
+  // `OpenAI`, `xAI`) — real bare slugs (`claude-sonnet-5`) are all lowercase.
+  return /[A-Z]/.test(slug) && !slug.includes("/") && !slug.includes(":");
+}
+
+/** Usage/example/footer lines after the catalog (`Pass the full id …`, `cmd --model …`, `Docs: …`). */
+function isCatalogFooter(line: string): boolean {
+  return (
+    /^pass the full id/i.test(line) || /^cmd\s+--model\b/i.test(line) || /^docs:\s/i.test(line)
+  );
 }
 
 export function parseCommandCodeModelList(output: string): ReadonlyArray<ServerProviderModel> {
@@ -47,7 +55,7 @@ export function parseCommandCodeModelList(output: string): ReadonlyArray<ServerP
 
   for (const rawLine of output.split(/\r?\n/)) {
     const line = stripAnsi(rawLine).trimEnd();
-    if (line.length === 0 || /^available models/i.test(line)) {
+    if (line.length === 0 || /^available models/i.test(line) || isCatalogFooter(line)) {
       continue;
     }
     const match = line.match(/^(\S+)(?:\s{2,}(.*))?$/);

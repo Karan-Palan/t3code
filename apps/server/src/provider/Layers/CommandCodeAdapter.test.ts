@@ -66,12 +66,18 @@ function makeConfig(binaryPath: string): CommandCodeSettings {
   } as unknown as CommandCodeSettings;
 }
 
-/** Run a scenario to its terminal runtime event and return every event seen. */
-function collectN(
+/**
+ * Run a scenario to its terminal runtime event and return every event seen.
+ * The terminal event is included: `Stream.takeUntil` emits the matching
+ * element by default (verified against this repo's Effect version,
+ * 4.0.0-rc.112 — elements are only dropped with `{ excludeLast: true }`).
+ */
+function collectUntilTurnEnd(
   stream: Stream.Stream<ProviderRuntimeEvent>,
-  count: number,
 ): Effect.Effect<ReadonlyArray<ProviderRuntimeEvent>> {
-  return Stream.runCollect(Stream.take(stream, count)).pipe(
+  return stream.pipe(
+    Stream.takeUntil((event) => event.type === "turn.completed" || event.type === "turn.aborted"),
+    Stream.runCollect,
     Effect.map((events) => Array.from(events)),
   );
 }
@@ -91,9 +97,10 @@ describe("CommandCodeAdapter (mock CLI)", () => {
           });
           yield* adapter.startSession({ threadId, cwd: harness.cwd, runtimeMode: "full-access" });
 
-          const eventsFiber = yield* Effect.forkScoped(collectN(adapter.streamEvents, 6));
-          // Let the collector subscribe to the pubsub before the turn emits.
-          yield* Effect.yieldNow;
+          const eventsFiber = yield* Effect.forkScoped(collectUntilTurnEnd(adapter.streamEvents));
+          // Yield to let the collector subscribe to the pubsub before the
+          // turn emits; unbounded pubsubs drop events no subscriber has
+          // requested yet, so the handshake must precede `sendTurn`.
           yield* Effect.yieldNow;
           const first = yield* adapter.sendTurn({
             threadId,
@@ -153,7 +160,7 @@ describe("CommandCodeAdapter (mock CLI)", () => {
           });
           yield* adapter.startSession({ threadId, cwd: harness.cwd, runtimeMode: "full-access" });
 
-          const eventsFiber = yield* Effect.forkScoped(collectN(adapter.streamEvents, 4));
+          const eventsFiber = yield* Effect.forkScoped(collectUntilTurnEnd(adapter.streamEvents));
           const sendFiber = yield* Effect.forkScoped(
             adapter.sendTurn({ threadId, input: "tarea larga" }),
           );

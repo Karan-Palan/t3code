@@ -23,6 +23,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -250,6 +251,10 @@ export function makeCommandCodeSnapshotShape(input: CommandCodeSnapshotInput) {
       }),
     );
     const state = yield* Ref.make<ServerProvider>(pending);
+    // Serialize refreshes like makeManagedServerProvider's refreshSemaphore:
+    // concurrent refresh() calls share one in-flight probe instead of
+    // spawning a CLI probe each.
+    const refreshSemaphore = yield* Semaphore.make(1);
 
     const publish = (next: ServerProvider): Effect.Effect<void> =>
       Ref.modify(state, (current) => {
@@ -263,7 +268,7 @@ export function makeCommandCodeSnapshotShape(input: CommandCodeSnapshotInput) {
         ),
       );
 
-    const refresh = Effect.gen(function* () {
+    const refreshBase = Effect.gen(function* () {
       const draft = yield* checkCommandCodeProvider({ config: input.config, env: input.env }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
@@ -271,6 +276,7 @@ export function makeCommandCodeSnapshotShape(input: CommandCodeSnapshotInput) {
       yield* publish(next);
       return next;
     });
+    const refresh = refreshSemaphore.withPermits(1)(refreshBase);
 
     const maintenance = makeManualOnlyProviderMaintenanceCapabilities({
       provider: input.driverKind,
